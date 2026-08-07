@@ -41,6 +41,7 @@ import hashlib
 import html
 import io
 import json
+import os
 import re
 import textwrap
 import uuid
@@ -70,7 +71,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 SCHEMA_VERSION = 1
 
 
@@ -944,18 +945,145 @@ def build_pdf(doc: Dict[str, Any]) -> bytes:
 # -----------------------------------------------------------------------------
 
 
+def _secret_value(source: Any, *names: str, default: str = "") -> str:
+    """Return the first non-empty value from a secrets/config mapping."""
+    for name in names:
+        try:
+            value = source.get(name, "")
+        except Exception:
+            try:
+                value = source[name]
+            except Exception:
+                value = ""
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _normalize_github_repo(repo: str) -> str:
+    """Accept OWNER/REPO or a normal GitHub repository URL."""
+    repo = str(repo or "").strip().rstrip("/")
+    repo = re.sub(r"\.git$", "", repo, flags=re.IGNORECASE)
+    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:"):
+        if repo.lower().startswith(prefix.lower()):
+            repo = repo[len(prefix):]
+            break
+    return repo.strip("/")
+
+
 def github_config() -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """
+    Read GitHub settings from Streamlit Cloud Secrets, local secrets.toml,
+    or environment variables. Both nested and top-level secret formats work.
+
+    Preferred Streamlit Secrets format:
+
+        [github]
+        token = "github_pat_..."
+        repo = "OWNER/REPOSITORY"
+        branch = "main"
+        base_path = "picu_cheat_sheets"
+
+    Also supported:
+
+        GITHUB_TOKEN = "github_pat_..."
+        GITHUB_REPO = "OWNER/REPOSITORY"
+        GITHUB_BRANCH = "main"
+        GITHUB_BASE_PATH = "picu_cheat_sheets"
+    """
+    nested: Any = {}
+    root: Any = {}
     try:
-        cfg = st.secrets.get("github", {})
+        root = st.secrets
+        try:
+            nested = st.secrets["github"]
+        except Exception:
+            try:
+                nested = st.secrets.get("github", {})
+            except Exception:
+                nested = {}
     except Exception:
-        cfg = {}
-    token = str(cfg.get("token", "")).strip()
-    repo = str(cfg.get("repo", "")).strip()
-    branch = str(cfg.get("branch", "main")).strip() or "main"
-    base_path = str(cfg.get("base_path", "picu_cheat_sheets")).strip().strip("/") or "picu_cheat_sheets"
-    if not token or not repo or "/" not in repo:
-        return None, "GitHub is not configured. Add token and repo under [github] in .streamlit/secrets.toml."
+        root = {}
+        nested = {}
+
+    token = (
+        _secret_value(nested, "token", "github_token")
+        or _secret_value(root, "GITHUB_TOKEN", "github_token")
+        or os.getenv("GITHUB_TOKEN", "").strip()
+    )
+    repo = (
+        _secret_value(nested, "repo", "repository")
+        or _secret_value(root, "GITHUB_REPO", "github_repo")
+        or os.getenv("GITHUB_REPO", "").strip()
+    )
+    branch = (
+        _secret_value(nested, "branch")
+        or _secret_value(root, "GITHUB_BRANCH", "github_branch")
+        or os.getenv("GITHUB_BRANCH", "").strip()
+        or "main"
+    )
+    base_path = (
+        _secret_value(nested, "base_path", "basepath", "path")
+        or _secret_value(root, "GITHUB_BASE_PATH", "github_base_path")
+        or os.getenv("GITHUB_BASE_PATH", "").strip()
+        or "picu_cheat_sheets"
+    )
+
+    repo = _normalize_github_repo(repo)
+    base_path = str(base_path).strip().strip("/") or "picu_cheat_sheets"
+
+    missing = []
+    if not token:
+        missing.append("token")
+    if not repo:
+        missing.append("repo")
+    elif repo.count("/") != 1:
+        return None, (
+            "GitHub repository is not in a recognized format. Use OWNER/REPOSITORY "
+            "or paste the full https://github.com/OWNER/REPOSITORY URL."
+        )
+
+    if missing:
+        return None, (
+            "GitHub is not configured yet. In Streamlit Community Cloud, open "
+            "Manage app → Settings → Secrets and add the [github] block shown below. "
+            "For local use, put the same block in .streamlit/secrets.toml. "
+            f"Missing: {', '.join(missing)}."
+        )
+
     return {"token": token, "repo": repo, "branch": branch, "base_path": base_path}, None
+
+
+def test_github_connection() -> Tuple[bool, str]:
+    """Verify the configured token, repository, and branch without exposing secrets."""
+    cfg, error = github_config()
+    if error or not cfg:
+        return False, error or "GitHub configuration missing."
+
+    headers = github_headers(cfg["token"])
+    repo_url = f"https://api.github.com/repos/{cfg['repo']}"
+    try:
+        response = requests.get(repo_url, headers=headers, timeout=20)
+    except requests.RequestException as exc:
+        return False, f"Could not reach GitHub: {exc}"
+
+    if response.status_code == 401:
+        return False, "GitHub rejected the token (401). Check or regenerate the token."
+    if response.status_code == 403:
+        return False, "GitHub denied access (403). Make sure the token has Contents: Read and write access to this repository."
+    if response.status_code == 404:
+        return False, "Repository not found (404). Check OWNER/REPOSITORY and make sure the token has access to the private repository."
+    if response.status_code != 200:
+        return False, f"GitHub connection failed ({response.status_code}): {response.text[:250]}"
+
+    branch_url = f"https://api.github.com/repos/{cfg['repo']}/branches/{cfg['branch']}"
+    branch_response = requests.get(branch_url, headers=headers, timeout=20)
+    if branch_response.status_code == 404:
+        return False, f"Repository connected, but branch '{cfg['branch']}' was not found."
+    if branch_response.status_code != 200:
+        return False, f"Repository connected, but branch check failed ({branch_response.status_code})."
+
+    return True, f"Connected to {cfg['repo']} on branch '{cfg['branch']}'."
 
 
 def github_headers(token: str) -> Dict[str, str]:
@@ -1350,12 +1478,27 @@ def main() -> None:
         cfg, cfg_error = github_config()
         if cfg_error:
             st.warning(cfg_error)
+            st.caption("For the web-based Streamlit app, paste this directly into Manage app → Settings → Secrets. You do not need a secrets.toml file on Streamlit Cloud.")
             st.code(
                 '[github]\ntoken = "github_pat_..."\nrepo = "OWNER/REPOSITORY"\nbranch = "main"\nbase_path = "picu_cheat_sheets"',
                 language="toml",
             )
+            with st.expander("Alternative top-level Secrets format"):
+                st.code(
+                    'GITHUB_TOKEN = "github_pat_..."\nGITHUB_REPO = "OWNER/REPOSITORY"\nGITHUB_BRANCH = "main"\nGITHUB_BASE_PATH = "picu_cheat_sheets"',
+                    language="toml",
+                )
         else:
-            st.success(f"Connected archive: {cfg['repo']} / {cfg['base_path']} ({cfg['branch']})")
+            st.success(f"Archive configured: {cfg['repo']} / {cfg['base_path']} ({cfg['branch']})")
+            connection_cols = st.columns([1, 2])
+            if connection_cols[0].button("Test GitHub connection", use_container_width=True):
+                ok, message = test_github_connection()
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
+            connection_cols[1].caption("The test checks the token, repository access, and branch without displaying your token.")
+
             action_cols = st.columns([1, 1, 2])
             if action_cols[0].button("Save to GitHub", type="primary", use_container_width=True):
                 try:
