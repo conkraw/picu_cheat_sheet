@@ -13,12 +13,13 @@ Core features
 - Multiple visual themes
 - Section-level graphics (PNG/JPG/WebP), captions, colors, and column spans
 - JSON import/export for AI-assisted drafting
-- GitHub archive save/load/delete using the GitHub Contents API
-- Styled PDF export using ReportLab
+- User-controlled GitHub JSON filenames plus archive save/load/delete using the GitHub Contents API
+- Preview-matched PDF export using the same HTML/CSS layout (WeasyPrint)
+- ReportLab fallback PDF export if WeasyPrint is unavailable
 
 Install
 -------
-pip install streamlit reportlab pillow requests
+pip install streamlit reportlab pillow requests weasyprint
 
 Run
 ---
@@ -54,6 +55,13 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image as PILImage
+
+try:
+    from weasyprint import HTML as WeasyHTML
+    WEASYPRINT_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - depends on deployment environment
+    WeasyHTML = None
+    WEASYPRINT_IMPORT_ERROR = exc
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, letter, landscape, portrait
@@ -71,7 +79,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
 
 
@@ -316,6 +324,7 @@ def new_document(template_name: str = "Troubleshooting guide") -> Dict[str, Any]
         "app_version": APP_VERSION,
         "archive_id": uuid.uuid4().hex[:12],
         "github_filename": "",
+        "archive_name": "",
         "title": "PICU Clinical Cheat Sheet",
         "subtitle": template["subtitle"],
         "author": "",
@@ -400,6 +409,57 @@ def current_filename(doc: Dict[str, Any], extension: str) -> str:
     return f"{slugify(str(doc.get('title', 'picu-cheat-sheet')))}.{extension.lstrip('.')}"
 
 
+def archive_name_default(doc: Dict[str, Any]) -> str:
+    """Human-friendly archive stem shown in the UI.
+
+    Older versions prefixed GitHub files with a 12-character archive id.  When
+    one of those files is loaded, hide that technical prefix from the editable
+    name so it is easy to rename on the next save.
+    """
+    explicit = str(doc.get("archive_name", "")).strip()
+    if explicit:
+        return re.sub(r"\.json$", "", explicit, flags=re.IGNORECASE).strip()
+
+    existing = str(doc.get("github_filename", "")).strip()
+    if existing:
+        stem = re.sub(r"\.json$", "", existing, flags=re.IGNORECASE)
+        stem = re.sub(r"^[0-9a-fA-F]{12}[_-]", "", stem)
+        if stem:
+            return stem
+
+    return str(doc.get("title", "PICU Clinical Cheat Sheet")).strip() or "PICU Clinical Cheat Sheet"
+
+
+def sanitize_archive_stem(value: str, max_length: int = 110) -> str:
+    """Make a readable, GitHub-safe filename stem while preserving user intent."""
+    value = re.sub(r"\.json$", "", str(value or "").strip(), flags=re.IGNORECASE)
+    value = value.replace("/", "-").replace("\\", "-")
+    value = re.sub(r"[^A-Za-z0-9._() +&-]+", "", value)
+    value = re.sub(r"\s+", "_", value).strip(" ._-" )
+    if not value:
+        value = "PICU_Cheat_Sheet"
+    return value[:max_length].rstrip(" ._-" )
+
+
+def archive_json_filename(doc: Dict[str, Any]) -> str:
+    requested = archive_name_default(doc)
+    return f"{sanitize_archive_stem(requested)}.json"
+
+
+def mix_hex_colors(base_hex: str, accent_hex: str, accent_fraction: float = 0.08) -> str:
+    """Return a deterministic light tint used by both preview and PDF CSS."""
+    def rgb(value: str) -> Tuple[int, int, int]:
+        value = value.strip().lstrip("#")
+        if len(value) != 6 or not re.fullmatch(r"[0-9A-Fa-f]{6}", value):
+            return (255, 255, 255)
+        return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+
+    base = rgb(base_hex)
+    accent = rgb(accent_hex)
+    f = min(1.0, max(0.0, float(accent_fraction)))
+    mixed = tuple(round(b * (1 - f) + a * f) for b, a in zip(base, accent))
+    return "#" + "".join(f"{channel:02X}" for channel in mixed)
+
 def data_uri(mime: str, b64_data: str) -> str:
     return f"data:{mime or 'image/png'};base64,{b64_data}"
 
@@ -453,7 +513,13 @@ def preview_body_html(text: str) -> str:
     return "".join(blocks)
 
 
-def build_preview_html(doc: Dict[str, Any]) -> str:
+def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
+    """Render the visual sheet.
+
+    The browser preview and the preferred PDF export deliberately share this
+    exact HTML/CSS so the downloaded PDF is visually faithful to what the user
+    approved on screen.
+    """
     theme = THEMES[doc["theme_name"]]
     orientation = doc.get("orientation", "Landscape")
     aspect = "11 / 8.5" if orientation == "Landscape" else "8.5 / 11"
@@ -461,6 +527,7 @@ def build_preview_html(doc: Dict[str, Any]) -> str:
 
     for idx, sec in enumerate(doc["sections"], start=1):
         accent = accent_for(sec, theme)
+        tint = mix_hex_colors(theme["card_bg"], accent, 0.08)
         kind = sec.get("kind", "card")
         span = min(3, max(1, int(sec.get("span", 1))))
         number_html = f"<span class='badge'>{idx}</span>" if doc.get("show_numbers", True) and kind != "bottom_line" else ""
@@ -475,15 +542,16 @@ def build_preview_html(doc: Dict[str, Any]) -> str:
         pearl_html = f"<div class='pearl'>{html.escape(str(sec.get('pearl', '')))}</div>" if sec.get("pearl") else ""
         position = str(sec.get("graphic_position", "Right")).lower().replace(" ", "-")
         classes = f"card kind-{kind} graphic-{position}"
+        style_vars = f"grid-column: span {span}; --accent:{accent}; --tint:{tint};"
         if kind == "bottom_line":
             sections_html.append(
-                f"<section class='{classes}' style='grid-column: span {span}; --accent:{accent};'>"
+                f"<section class='{classes}' style='{style_vars}'>"
                 f"<div class='bottom-inner'><strong>{html.escape(str(sec.get('title', 'Bottom line')))}</strong>"
                 f"<span>{body_html}</span></div></section>"
             )
         else:
             sections_html.append(
-                f"<section class='{classes}' style='grid-column: span {span}; --accent:{accent};'>"
+                f"<section class='{classes}' style='{style_vars}'>"
                 f"<header>{number_html}<span>{html.escape(str(sec.get('title', 'Untitled')))}</span></header>"
                 f"<div class='card-content'><div class='text'>{body_html}{pearl_html}</div>{image_html}</div>"
                 f"</section>"
@@ -492,6 +560,27 @@ def build_preview_html(doc: Dict[str, Any]) -> str:
     footer_html = ""
     if doc.get("show_footer", True):
         footer_html = f"<footer>{html.escape(str(doc.get('footer_text', '')))}</footer>"
+
+    pdf_css = ""
+    if for_pdf:
+        is_letter = doc.get("paper_size", "Letter") == "Letter"
+        if is_letter and orientation == "Landscape":
+            page_rule, page_w, page_h = "Letter landscape", "11in", "8.5in"
+        elif is_letter:
+            page_rule, page_w, page_h = "Letter portrait", "8.5in", "11in"
+        elif orientation == "Landscape":
+            page_rule, page_w, page_h = "A4 landscape", "297mm", "210mm"
+        else:
+            page_rule, page_w, page_h = "A4 portrait", "210mm", "297mm"
+
+        pdf_css = f"""
+@page {{ size: {page_rule}; margin: 0; }}
+html, body {{ margin: 0 !important; padding: 0 !important; width: {page_w}; min-height: {page_h}; background: {theme['page_bg']}; }}
+body {{ overflow: visible; }}
+.page {{ width: {page_w}; min-height: {page_h}; max-width: none; margin: 0; aspect-ratio: auto; box-shadow: none; overflow: visible; padding-bottom: 24px; }}
+.card {{ break-inside: avoid; page-break-inside: avoid; }}
+footer {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 999; }}
+"""
 
     return f"""
 <!DOCTYPE html>
@@ -524,8 +613,8 @@ figcaption {{ font-size: 9px; color: {theme['muted']}; margin-top: 2px; }}
 .graphic-top figure, .graphic-bottom figure, .graphic-full-width figure {{ flex-basis: auto; }}
 .graphic-top figure img, .graphic-bottom figure img, .graphic-full-width figure img {{ max-height: 155px; }}
 .kind-warning {{ border-color: var(--accent); }}
-.kind-warning .card-content {{ background: color-mix(in srgb, var(--accent) 7%, white); }}
-.kind-formula .card-content {{ background: color-mix(in srgb, var(--accent) 6%, white); }}
+.kind-warning .card-content {{ background: var(--tint); }}
+.kind-formula .card-content {{ background: var(--tint); }}
 .kind-formula p {{ font-size: 14px; font-weight: 600; }}
 .kind-pearl .pearl, .pearl {{ margin-top: 7px; padding: 6px 8px; border-left: 4px solid var(--accent); background: #F3F7FA; font-size: 11px; font-weight: 700; }}
 .kind-bottom_line {{ color: white; border-color: {theme['navy']}; background: {theme['navy']}; min-height: 48px; }}
@@ -538,6 +627,7 @@ footer {{ background: {theme['footer_bg']}; color: {theme['footer_text']}; paddi
   .grid {{ grid-template-columns: 1fr; }}
   .card {{ grid-column: span 1 !important; }}
 }}
+{pdf_css}
 </style>
 </head>
 <body>
@@ -803,7 +893,7 @@ def page_dimensions(doc: Dict[str, Any]) -> Tuple[float, float]:
     return landscape(base) if doc.get("orientation", "Landscape") == "Landscape" else portrait(base)
 
 
-def build_pdf(doc: Dict[str, Any]) -> bytes:
+def build_pdf_reportlab(doc: Dict[str, Any]) -> bytes:
     buffer = io.BytesIO()
     page_size = page_dimensions(doc)
     page_w, page_h = page_size
@@ -938,6 +1028,19 @@ def build_pdf(doc: Dict[str, Any]) -> bytes:
 
     doc_template.build(story, onFirstPage=draw_page_background, onLaterPages=draw_page_background)
     return buffer.getvalue()
+
+
+def build_pdf(doc: Dict[str, Any]) -> bytes:
+    """Create a PDF that visually matches the on-screen preview.
+
+    WeasyPrint renders the same HTML/CSS used by the preview, including rounded
+    cards, numbered badges, graphics, spacing, colors, and bottom-line banner.
+    The original ReportLab renderer remains as a deployment-safe fallback.
+    """
+    if WeasyHTML is not None:
+        html_source = build_preview_html(doc, for_pdf=True)
+        return WeasyHTML(string=html_source, base_url=os.getcwd()).write_pdf()
+    return build_pdf_reportlab(doc)
 
 
 # -----------------------------------------------------------------------------
@@ -1101,25 +1204,44 @@ def github_api_url(repo: str, path: str) -> str:
 
 def save_document_to_github(doc: Dict[str, Any]) -> str:
     cfg, error = github_config()
-    if error or not cfg:
-        raise RuntimeError(error or "GitHub configuration missing.")
+    if error:
+        raise RuntimeError(error)
 
-    filename = str(doc.get("github_filename", "")).strip()
-    if not filename:
-        filename = f"{doc['archive_id']}_{slugify(str(doc.get('title', 'cheat-sheet')))}.json"
-        doc["github_filename"] = filename
-    path = f"{cfg['base_path']}/{filename}"
+    desired_filename = archive_json_filename(doc)
+    previous_filename = str(doc.get("github_filename", "")).strip()
+    doc["archive_name"] = re.sub(r"\.json$", "", str(doc.get("archive_name") or archive_name_default(doc)), flags=re.IGNORECASE)
+    doc["github_filename"] = desired_filename
+
+    path = f"{cfg['base_path']}/{desired_filename}"
     url = github_api_url(cfg["repo"], path)
     headers = github_headers(cfg["token"])
-
-    sha = None
     existing = requests.get(url, headers=headers, params={"ref": cfg["branch"]}, timeout=20)
+    sha = None
+
     if existing.status_code == 200:
-        sha = existing.json().get("sha")
+        existing_payload = existing.json()
+        sha = existing_payload.get("sha")
+        # If the user renamed this guide to a filename already owned by a
+        # different archived guide, do not silently overwrite it.
+        if previous_filename != desired_filename:
+            try:
+                encoded = str(existing_payload.get("content", "")).replace("\n", "")
+                existing_doc = json.loads(base64.b64decode(encoded).decode("utf-8")) if encoded else {}
+                existing_archive_id = str(existing_doc.get("archive_id", ""))
+                if existing_archive_id and existing_archive_id != str(doc.get("archive_id", "")):
+                    doc["github_filename"] = previous_filename
+                    raise RuntimeError(
+                        f"The archive filename '{desired_filename}' is already used by another cheat sheet. "
+                        "Choose a different archive name."
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
     elif existing.status_code != 404:
+        doc["github_filename"] = previous_filename
         raise RuntimeError(f"GitHub lookup failed ({existing.status_code}): {existing.text[:300]}")
 
-    doc["updated_at"] = utc_now_iso()
     payload: Dict[str, Any] = {
         "message": f"Save PICU cheat sheet: {doc.get('title', 'Untitled')}",
         "content": base64.b64encode(document_json_bytes(doc)).decode("ascii"),
@@ -1127,9 +1249,38 @@ def save_document_to_github(doc: Dict[str, Any]) -> str:
     }
     if sha:
         payload["sha"] = sha
+
     response = requests.put(url, headers=headers, json=payload, timeout=30)
-    if response.status_code not in {200, 201}:
-        raise RuntimeError(f"GitHub save failed ({response.status_code}): {response.text[:500]}")
+    if response.status_code not in (200, 201):
+        doc["github_filename"] = previous_filename
+        raise RuntimeError(f"GitHub save failed ({response.status_code}): {response.text[:400]}")
+
+    # A rename should behave like a rename, not leave an obsolete duplicate.
+    if previous_filename and previous_filename != desired_filename:
+        old_path = f"{cfg['base_path']}/{previous_filename}"
+        old_url = github_api_url(cfg["repo"], old_path)
+        old_existing = requests.get(old_url, headers=headers, params={"ref": cfg["branch"]}, timeout=20)
+        if old_existing.status_code == 200:
+            old_sha = old_existing.json().get("sha")
+            if old_sha:
+                delete_response = requests.delete(
+                    old_url,
+                    headers=headers,
+                    json={
+                        "message": f"Rename PICU cheat sheet archive: {previous_filename} -> {desired_filename}",
+                        "sha": old_sha,
+                        "branch": cfg["branch"],
+                    },
+                    timeout=30,
+                )
+                if delete_response.status_code not in (200, 201):
+                    # The new file is safely saved.  Surface a warning through
+                    # the caller without risking loss of the newly named file.
+                    raise RuntimeError(
+                        f"Saved as {path}, but GitHub could not remove the old filename "
+                        f"'{previous_filename}'. Delete the old archive entry manually if needed."
+                    )
+
     return path
 
 
@@ -1467,12 +1618,15 @@ def main() -> None:
         download_cols[1].download_button(
             "Download JSON",
             data=document_json_bytes(doc),
-            file_name=current_filename(doc, "json"),
+            file_name=archive_json_filename(doc),
             mime="application/json",
             use_container_width=True,
         )
         download_cols[2].button("Refresh preview", use_container_width=True)
-        st.caption("The on-screen preview is responsive. The PDF uses a fixed 3-column clinical handout layout and may paginate when content is long.")
+        if WeasyHTML is not None:
+            st.caption("PDF export uses the same HTML/CSS as this preview, so colors, rounded cards, badges, graphics, spacing, and layout should closely match what you see above.")
+        else:
+            st.warning("Preview-matched PDF rendering is unavailable in this deployment. Add `weasyprint>=68.0` to requirements.txt; the app is currently using the legacy ReportLab fallback.")
 
     with archive_tab:
         cfg, cfg_error = github_config()
@@ -1498,6 +1652,16 @@ def main() -> None:
                 else:
                     st.error(message)
             connection_cols[1].caption("The test checks the token, repository access, and branch without displaying your token.")
+
+            st.markdown("#### Archive filename")
+            archive_input_default = archive_name_default(doc)
+            doc["archive_name"] = st.text_input(
+                "JSON archive name",
+                value=archive_input_default,
+                key=f"archive_name_{doc.get('archive_id', 'current')}",
+                help="Choose the readable name you want to see in GitHub. The app adds .json automatically and no longer adds a random archive-ID prefix.",
+            )
+            st.caption(f"Will save as: `{archive_json_filename(doc)}`")
 
             action_cols = st.columns([1, 1, 2])
             if action_cols[0].button("Save to GitHub", type="primary", use_container_width=True):
@@ -1566,7 +1730,7 @@ def main() -> None:
             st.download_button(
                 "Download current JSON",
                 data=document_json_bytes(doc),
-                file_name=current_filename(doc, "json"),
+                file_name=archive_json_filename(doc),
                 mime="application/json",
                 use_container_width=True,
             )
