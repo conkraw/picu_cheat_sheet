@@ -1,5 +1,5 @@
 """
-PICU Cheat Sheet Builder v1.3
+PICU Cheat Sheet Builder v1.4
 ============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
@@ -166,8 +166,13 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.0"
 SCHEMA_VERSION = 1
+
+# The Streamlit preview is intentionally designed around this visual canvas width.
+# PDF print CSS scales typography, spacing, and card geometry from the same reference
+# so the PDF preserves the proportions and line wrapping users approved on screen.
+PREVIEW_REFERENCE_WIDTH_PX = 760.0
 
 
 # -----------------------------------------------------------------------------
@@ -629,7 +634,7 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
         pearl_html = f"<div class='pearl'>{html.escape(str(sec.get('pearl', '')))}</div>" if sec.get("pearl") else ""
         position = str(sec.get("graphic_position", "Right")).lower().replace(" ", "-")
         classes = f"card kind-{kind} graphic-{position}"
-        style_vars = f"grid-column: span {span}; --accent:{accent}; --tint:{tint};"
+        style_vars = f"grid-column: span {span}; --span:{span}; --accent:{accent}; --tint:{tint};"
         if kind == "bottom_line":
             sections_html.append(
                 f"<section class='{classes}' style='{style_vars}'>"
@@ -660,6 +665,22 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
         else:
             page_rule, page_w, page_h = "A4 portrait", "210mm", "297mm"
 
+        # Chromium prints an 11-inch page at 96 CSS px/in, which is wider than
+        # the Streamlit preview canvas. If we merely stretch the grid, the PDF
+        # gets tiny text, different wrapping, and a very different visual rhythm.
+        # Scale *all* preview geometry by the page-width/reference-width ratio.
+        if is_letter:
+            page_w_px = (11.0 if orientation == "Landscape" else 8.5) * 96.0
+            page_h_px = (8.5 if orientation == "Landscape" else 11.0) * 96.0
+        else:
+            mm_w, mm_h = ((297.0, 210.0) if orientation == "Landscape" else (210.0, 297.0))
+            page_w_px = mm_w / 25.4 * 96.0
+            page_h_px = mm_h / 25.4 * 96.0
+        ps = page_w_px / PREVIEW_REFERENCE_WIDTH_PX
+
+        def px(value: float) -> str:
+            return f"{value * ps:.2f}px"
+
         pdf_css = f"""
 @page {{ size: {page_rule}; margin: 0; }}
 html, body {{
@@ -681,12 +702,68 @@ body {{ overflow: visible; }}
   box-shadow: none;
   overflow: visible;
 }}
+
+/* Preserve the preview's 3-column layout even if Chromium reports a narrow
+   print viewport. The span is carried in --span on every card. */
+.grid {{
+  grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  gap: {px(9)} !important;
+  padding: {px(11)} !important;
+}}
+.card {{
+  grid-column: span var(--span) !important;
+  min-height: {px(105)} !important;
+  border-width: {px(1.5)} !important;
+  border-radius: {px(10)} !important;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}}
+.title {{ padding: {px(18)} {px(24)} {px(14)} !important; }}
+.title h1 {{ font-size: {px(33)} !important; line-height: 1.05 !important; }}
+.title h2 {{ margin-top: {px(5)} !important; font-size: {px(16)} !important; }}
+.card header {{
+  min-height: {px(35)} !important;
+  padding: {px(7)} {px(10)} !important;
+  font-size: {px(16)} !important;
+  gap: {px(8)} !important;
+}}
+.badge {{
+  width: {px(24)} !important;
+  height: {px(24)} !important;
+  font-size: {px(14)} !important;
+}}
+.card-content {{
+  gap: {px(9)} !important;
+  padding: {px(9)} {px(11)} {px(10)} !important;
+}}
+p {{ margin-bottom: {px(5)} !important; font-size: {px(13)} !important; line-height: 1.23 !important; }}
+ul {{ margin: {px(2)} 0 {px(4)} {px(18)} !important; }}
+li {{ margin-bottom: {px(3)} !important; font-size: {px(13)} !important; line-height: 1.2 !important; }}
+.space {{ height: {px(3)} !important; }}
+figure img {{ max-height: {px(125)} !important; }}
+figcaption {{ font-size: {px(9)} !important; margin-top: {px(2)} !important; }}
+.graphic-top figure img, .graphic-bottom figure img, .graphic-full-width figure img {{ max-height: {px(155)} !important; }}
+.kind-formula p {{ font-size: {px(14)} !important; }}
+.kind-pearl .pearl, .pearl {{
+  margin-top: {px(7)} !important;
+  padding: {px(6)} {px(8)} !important;
+  border-left-width: {px(4)} !important;
+  font-size: {px(11)} !important;
+}}
+.kind-bottom_line {{ min-height: {px(48)} !important; }}
+.bottom-inner {{ padding: {px(11)} {px(16)} !important; gap: {px(12)} !important; }}
+.bottom-inner strong {{ font-size: {px(16)} !important; }}
+.bottom-inner span p {{ font-size: {px(13)} !important; }}
+footer {{
+  position: static;
+  margin-top: auto;
+  padding: {px(6)} {px(12)} !important;
+  font-size: {px(9)} !important;
+}}
 .title, .card, .card header, .badge, .pearl, .kind-bottom_line, footer {{
   -webkit-print-color-adjust: exact !important;
   print-color-adjust: exact !important;
 }}
-.card {{ break-inside: avoid; page-break-inside: avoid; }}
-footer {{ position: static; margin-top: auto; }}
 """
 
     return f"""
@@ -697,7 +774,7 @@ footer {{ position: static; margin-top: auto; }}
 <style>
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; padding: 18px; background: #E7EDF3; font-family: Arial, Helvetica, sans-serif; color: {theme['text']}; }}
-.page {{ width: 100%; max-width: 1180px; margin: 0 auto; aspect-ratio: {aspect}; min-height: 720px; background: {theme['page_bg']}; box-shadow: 0 8px 28px rgba(20,40,60,.18); display: flex; flex-direction: column; overflow: hidden; }}
+.page {{ width: 100%; max-width: {int(PREVIEW_REFERENCE_WIDTH_PX)}px; margin: 0 auto; aspect-ratio: {aspect}; min-height: 720px; background: {theme['page_bg']}; box-shadow: 0 8px 28px rgba(20,40,60,.18); display: flex; flex-direction: column; overflow: hidden; }}
 .title {{ background: {theme['navy']}; color: {theme['title_text']}; padding: 18px 24px 14px; text-align: center; }}
 .title h1 {{ margin: 0; font-size: 33px; line-height: 1.05; letter-spacing: .2px; }}
 .title h2 {{ margin: 5px 0 0; font-size: 16px; font-weight: 600; font-style: italic; opacity: .95; }}
@@ -1227,7 +1304,7 @@ def build_pdf_with_engine(doc: Dict[str, Any]) -> Tuple[bytes, str, str]:
     failures: List[str] = []
 
     try:
-        return build_pdf_chromium(doc), "Chromium (preview-faithful)", "Rendered with the same browser HTML/CSS used for the preview."
+        return build_pdf_chromium(doc), "Chromium (preview-faithful)", "Rendered in Chromium with print geometry scaled from the same 760px design canvas used by the preview."
     except Exception as exc:
         failures.append(f"Chromium: {exc}")
 
@@ -1830,7 +1907,7 @@ def main() -> None:
         download_cols[2].button("Refresh preview", use_container_width=True)
         chrome_ok, chrome_detail = chromium_status()
         if pdf_engine_name.startswith("Chromium"):
-            st.success("PDF engine: Chromium - browser-faithful export. The PDF is printed from the exact same HTML/CSS used by the preview.")
+            st.success("PDF engine: Chromium - preview-proportioned export. The PDF preserves the preview grid, line wrapping, typography scale, spacing, colors, and card geometry.")
         elif pdf_engine_name.startswith("WeasyPrint"):
             st.warning("PDF engine: WeasyPrint fallback. This uses the same HTML/CSS, but it is not the same browser renderer as the preview, so small layout differences can remain.")
         elif pdf_engine_name.startswith("ReportLab"):
