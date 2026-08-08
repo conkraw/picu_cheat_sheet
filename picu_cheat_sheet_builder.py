@@ -1,5 +1,5 @@
 """
-PICU Cheat Sheet Builder v1.7
+PICU Cheat Sheet Builder v1.9
 ============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
@@ -166,7 +166,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.9.0"
 SCHEMA_VERSION = 1
 
 # The Streamlit preview is intentionally designed around this visual canvas width.
@@ -284,6 +284,7 @@ def section(
     span: int = 1,
     accent_index: int = 0,
     pearl: str = "",
+    bullet_each_line: Optional[bool] = None,
 ) -> Dict[str, Any]:
     return {
         "id": str(uuid.uuid4()),
@@ -294,6 +295,7 @@ def section(
         "accent_index": accent_index,
         "custom_accent": "",
         "pearl": pearl,
+        "bullet_each_line": (kind != "bottom_line") if bullet_each_line is None else bool(bullet_each_line),
         "graphic_b64": "",
         "graphic_name": "",
         "graphic_mime": "",
@@ -443,6 +445,10 @@ def normalize_section(raw: Dict[str, Any], index: int = 0) -> Dict[str, Any]:
         pearl=str(raw.get("pearl", "")),
     )
     item.update({k: v for k, v in raw.items() if k in item})
+    if "bullet_each_line" not in raw:
+        item["bullet_each_line"] = item.get("kind") != "bottom_line"
+    else:
+        item["bullet_each_line"] = bool(raw.get("bullet_each_line"))
     item["id"] = str(raw.get("id") or uuid.uuid4())
     item["span"] = min(3, max(1, int(item.get("span", 1))))
     item["accent_index"] = max(0, int(item.get("accent_index", 0)))
@@ -582,7 +588,14 @@ def contrasting_text(hex_color: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def preview_body_html(text: str) -> str:
+def preview_body_html(text: str, bullet_each_line: bool = False) -> str:
+    """Convert section text to compact preview HTML.
+
+    When bullet_each_line is enabled, every nonblank line becomes a bullet
+    automatically, so the author can simply type one teaching point per line
+    without manually entering '- '. Existing -, *, or • prefixes are stripped
+    to avoid doubled bullets.
+    """
     blocks: List[str] = []
     bullet_items: List[str] = []
 
@@ -598,13 +611,18 @@ def preview_body_html(text: str) -> str:
             flush_bullets()
             blocks.append("<div class='space'></div>")
             continue
-        escaped = html.escape(line)
+
+        has_marker = line.startswith(("- ", "* ", "• "))
+        display_line = line[2:].strip() if has_marker else line
+        escaped = html.escape(display_line)
         escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
-        if line.startswith(("- ", "* ", "• ")):
-            bullet_items.append(escaped[2:].strip())
+
+        if bullet_each_line or has_marker:
+            bullet_items.append(escaped)
         else:
             flush_bullets()
             blocks.append(f"<p>{escaped}</p>")
+
     flush_bullets()
     return "".join(blocks)
 
@@ -634,7 +652,7 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
                 + (f"<figcaption>{html.escape(str(sec.get('graphic_caption', '')))}</figcaption>" if sec.get("graphic_caption") else "")
                 + "</figure>"
             )
-        body_html = preview_body_html(str(sec.get("body", "")))
+        body_html = preview_body_html(str(sec.get("body", "")), bool(sec.get("bullet_each_line", False)))
         pearl_html = f"<div class='pearl'>{html.escape(str(sec.get('pearl', '')))}</div>" if sec.get("pearl") else ""
         position = str(sec.get("graphic_position", "Right")).lower().replace(" ", "-")
         classes = f"card kind-{kind} graphic-{position}"
@@ -943,7 +961,7 @@ def prepare_inline_markup(text: str) -> str:
     return escaped
 
 
-def body_flowables(text: str, style: ParagraphStyle, bullet_style: ParagraphStyle) -> List[Any]:
+def body_flowables(text: str, style: ParagraphStyle, bullet_style: ParagraphStyle, bullet_each_line: bool = False) -> List[Any]:
     flows: List[Any] = []
     pending_blank = False
     for raw_line in str(text or "").splitlines():
@@ -954,10 +972,12 @@ def body_flowables(text: str, style: ParagraphStyle, bullet_style: ParagraphStyl
         if pending_blank and flows:
             flows.append(Spacer(1, 2.5))
         pending_blank = False
-        if line.startswith(("- ", "* ", "• ")):
-            flows.append(Paragraph(prepare_inline_markup(line[2:].strip()), bullet_style, bulletText="•"))
+        has_marker = line.startswith(("- ", "* ", "• "))
+        display_line = line[2:].strip() if has_marker else line
+        if bullet_each_line or has_marker:
+            flows.append(Paragraph(prepare_inline_markup(display_line), bullet_style, bulletText="•"))
         else:
-            flows.append(Paragraph(prepare_inline_markup(line), style))
+            flows.append(Paragraph(prepare_inline_markup(display_line), style))
             flows.append(Spacer(1, 1.2))
     if not flows:
         flows.append(Paragraph(" ", style))
@@ -1063,7 +1083,7 @@ def make_card(sec: Dict[str, Any], idx: int, width: float, theme: Dict[str, Any]
             alignment=TA_CENTER,
         )
         header = Paragraph(f"<font color='#FFFFFF'><b>{label}</b></font>", header_style)
-        body_items = body_flowables(str(sec.get("body", "")), bottom_body_style, bullet_style)
+        body_items = body_flowables(str(sec.get("body", "")), bottom_body_style, bullet_style, bool(sec.get("bullet_each_line", False)))
         if sec.get("pearl"):
             body_items.append(Paragraph(prepare_inline_markup(str(sec.get("pearl", ""))), pearl_style))
 
@@ -1108,7 +1128,7 @@ def make_card(sec: Dict[str, Any], idx: int, width: float, theme: Dict[str, Any]
         title_style,
     )
 
-    body_items = body_flowables(str(sec.get("body", "")), body_style, bullet_style)
+    body_items = body_flowables(str(sec.get("body", "")), body_style, bullet_style, bool(sec.get("bullet_each_line", False)))
     if sec.get("pearl"):
         body_items.append(Paragraph(prepare_inline_markup(str(sec.get("pearl", ""))), pearl_style))
 
@@ -1754,7 +1774,8 @@ def ai_prompt(doc: Dict[str, Any]) -> str:
         "sections": [
             {
                 "title": "SECTION TITLE",
-                "body": "Use short paragraphs and bullet lines beginning with - ",
+                "body": "Put one concise teaching point on each line; no bullet character is needed.",
+                "bullet_each_line": True,
                 "kind": "card",
                 "span": 1,
                 "accent_index": 0,
@@ -1774,7 +1795,7 @@ def ai_prompt(doc: Dict[str, Any]) -> str:
 
         Writing style:
         - Bedside focused, concise, and clinically interpretive.
-        - Use short bullets rather than dense prose.
+        - Put one concise teaching point on each line. The app can add bullets automatically when bullet_each_line is true.
         - Organize causes into useful physiologic or troubleshooting categories.
         - Include practical reassessment and escalation guidance.
         - End with one memorable bottom-line section.
@@ -1785,6 +1806,9 @@ def ai_prompt(doc: Dict[str, Any]) -> str:
 
         Allowed span values:
         1 = one column, 2 = two columns, 3 = full width
+
+        bullet_each_line:
+        true = render every nonblank body line as a bullet; false = preserve paragraph-style lines
 
         Return a JSON object shaped like this example:
         {json.dumps(skeleton, indent=2)}
@@ -1871,7 +1895,15 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
             value=str(sec.get("body", "")),
             height=180,
             key=f"body_{sec_id}",
-            help="Use one idea per line. Begin bullet lines with '- '. Use **bold** for emphasis.",
+            help="Type one teaching point per line. With automatic bullets on, you do not need to type '- '. Use **bold** for emphasis.",
+            on_change=mark_section_active,
+            args=(sec_id,),
+        )
+        sec["bullet_each_line"] = st.checkbox(
+            "Bullet each line automatically",
+            value=bool(sec.get("bullet_each_line", sec.get("kind") != "bottom_line")),
+            key=f"bullet_each_line_{sec_id}",
+            help="Each nonblank line becomes its own bullet in the preview and PDF. Turn this off for paragraph-style text or equations.",
             on_change=mark_section_active,
             args=(sec_id,),
         )
@@ -1973,6 +2005,24 @@ def main() -> None:
         .block-container {padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1500px;}
         div[data-testid="stMetric"] {background:#f5f8fb; border:1px solid #dbe5ee; padding:8px 12px; border-radius:10px;}
         .small-note {font-size:.86rem; color:#5d6b7d;}
+
+        /* Make authoring text high-contrast. Streamlit/BaseWeb can otherwise
+           render form text in a softer gray that is hard to read during editing. */
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stTextArea"] textarea,
+        div[data-baseweb="input"] input,
+        div[data-baseweb="textarea"] textarea {
+            color: #111827 !important;
+            -webkit-text-fill-color: #111827 !important;
+            font-weight: 500 !important;
+            opacity: 1 !important;
+        }
+        div[data-testid="stTextInput"] input::placeholder,
+        div[data-testid="stTextArea"] textarea::placeholder {
+            color: #667085 !important;
+            -webkit-text-fill-color: #667085 !important;
+            opacity: 1 !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
