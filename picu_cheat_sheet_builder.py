@@ -1,5 +1,5 @@
 """
-PICU Cheat Sheet Builder v1.5
+PICU Cheat Sheet Builder v1.6
 ============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
@@ -166,7 +166,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 SCHEMA_VERSION = 1
 
 # The Streamlit preview is intentionally designed around this visual canvas width.
@@ -425,8 +425,8 @@ def new_document(template_name: str = "Troubleshooting guide") -> Dict[str, Any]
         "orientation": "Landscape",
         "paper_size": "Letter",
         "show_numbers": True,
-        "show_footer": True,
-        "footer_text": "Clinical education guide - use clinical judgment and local policies.",
+        "show_footer": False,
+        "footer_text": "",
         "created_at": now,
         "updated_at": now,
         "sections": copy.deepcopy(template["sections"]),
@@ -469,6 +469,10 @@ def normalize_document(raw: Dict[str, Any]) -> Dict[str, Any]:
         base["orientation"] = "Landscape"
     if base.get("paper_size") not in {"Letter", "A4"}:
         base["paper_size"] = "Letter"
+    # v1.6 intentionally removes the clinical disclaimer/footer from the sheet.
+    # Keep the legacy keys for JSON compatibility, but never render them.
+    base["show_footer"] = False
+    base["footer_text"] = ""
     base["updated_at"] = utc_now_iso()
     return base
 
@@ -636,10 +640,13 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
         classes = f"card kind-{kind} graphic-{position}"
         style_vars = f"grid-column: span {span}; --span:{span}; --accent:{accent}; --tint:{tint};"
         if kind == "bottom_line":
+            # Bottom-line banners support graphics too. Earlier versions rendered
+            # only the text because this special branch skipped image_html.
             sections_html.append(
                 f"<section class='{classes}' style='{style_vars}'>"
-                f"<div class='bottom-inner'><strong>{html.escape(str(sec.get('title', 'Bottom line')))}</strong>"
-                f"<span>{body_html}</span></div></section>"
+                f"<div class='bottom-inner'><div class='bottom-copy'>"
+                f"<strong>{html.escape(str(sec.get('title', 'Bottom line')))}</strong>"
+                f"<span>{body_html}</span></div>{image_html}</div></section>"
             )
         else:
             sections_html.append(
@@ -649,9 +656,8 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
                 f"</section>"
             )
 
+    # No disclaimer/footer in v1.6. Legacy JSON fields are ignored.
     footer_html = ""
-    if doc.get("show_footer", True):
-        footer_html = f"<footer>{html.escape(str(doc.get('footer_text', '')))}</footer>"
 
     pdf_css = ""
     pdf_fit_script = ""
@@ -701,15 +707,15 @@ body {{
 }}
 .page {{
   width: {page_w};
-  height: {page_h};
+  height: auto;
   min-height: {page_h};
   max-width: none;
   margin: 0;
   position: absolute;
   top: 0;
-  left: 50%;
-  transform-origin: top center;
-  transform: translateX(-50%) scale(1);
+  left: 0;
+  transform-origin: top left;
+  transform: scale(1);
   aspect-ratio: auto;
   box-shadow: none;
   overflow: visible;
@@ -764,15 +770,12 @@ figcaption {{ font-size: {px(9)} !important; margin-top: {px(2)} !important; }}
 }}
 .kind-bottom_line {{ min-height: {px(48)} !important; }}
 .bottom-inner {{ padding: {px(11)} {px(16)} !important; gap: {px(12)} !important; }}
+.bottom-copy {{ gap: {px(12)} !important; }}
 .bottom-inner strong {{ font-size: {px(16)} !important; }}
 .bottom-inner span p {{ font-size: {px(13)} !important; }}
-footer {{
-  position: static;
-  margin-top: auto;
-  padding: {px(6)} {px(12)} !important;
-  font-size: {px(9)} !important;
-}}
-.title, .card, .card header, .badge, .pearl, .kind-bottom_line, footer {{
+.kind-bottom_line figure img {{ max-height: {px(58)} !important; }}
+.kind-bottom_line figcaption {{ font-size: {px(8)} !important; }}
+.title, .card, .card header, .badge, .pearl, .kind-bottom_line {{
   -webkit-print-color-adjust: exact !important;
   print-color-adjust: exact !important;
 }}
@@ -783,38 +786,61 @@ footer {{
         # fitting pass uniformly scales the COMPLETE sheet (title, cards, graphics,
         # bottom line, and footer) just enough to fit. The page stays a single PDF
         # page instead of allowing Chromium to push the last row onto page 2.
-        target_height_px = max(1.0, page_h_px - 2.0)
+        target_height_px = max(1.0, page_h_px - 1.0)
+        # Fit vertically WITHOUT creating left/right white bands. When shrinking is
+        # needed, the unscaled sheet is widened by the inverse scale, then the whole
+        # design is scaled back down. The final transformed width therefore remains
+        # exactly the physical page width while text reflows into the extra width.
         pdf_fit_script = f"""
 <script>
 (function () {{
+  const PAGE_WIDTH = {page_w_px:.2f};
   const TARGET_HEIGHT = {target_height_px:.2f};
+
+  function applyScale(sheet, fit) {{
+    const safe = Math.max(0.30, Math.min(1, fit));
+    sheet.style.width = `${{PAGE_WIDTH / safe}}px`;
+    sheet.style.transform = `scale(${{safe}})`;
+    return safe;
+  }}
+
+  function displayedHeight(sheet, fit) {{
+    applyScale(sheet, fit);
+    // Force layout after changing width so wrapping is included in the measure.
+    void sheet.offsetHeight;
+    return Math.max(sheet.scrollHeight || 0, sheet.offsetHeight || 0) * fit;
+  }}
 
   function fitSheetToOnePage() {{
     const sheet = document.querySelector('.page');
     if (!sheet) return;
 
-    // Measure at the approved preview proportions before applying any fit.
-    sheet.style.transform = 'translateX(-50%) scale(1)';
-    const naturalHeight = Math.max(
-      sheet.scrollHeight || 0,
-      sheet.offsetHeight || 0,
-      sheet.getBoundingClientRect().height || 0
-    );
+    // If the full-width sheet already fits, preserve it at 100%.
+    if (displayedHeight(sheet, 1) <= TARGET_HEIGHT) {{
+      applyScale(sheet, 1);
+      sheet.dataset.printFitScale = '1.0000';
+      return;
+    }}
 
-    // A tiny safety factor prevents fractional-pixel rounding from creating a
-    // nearly-empty second PDF page. Only shrink when the content actually needs it.
-    const fit = naturalHeight > TARGET_HEIGHT
-      ? Math.max(0.01, (TARGET_HEIGHT / naturalHeight) * 0.995)
-      : 1;
+    // Largest scale that fits. Width expands inversely while measuring, so the
+    // final transformed design always uses the full printable width.
+    let low = 0.30;
+    let high = 1.00;
+    for (let i = 0; i < 16; i++) {{
+      const mid = (low + high) / 2;
+      if (displayedHeight(sheet, mid) <= TARGET_HEIGHT) low = mid;
+      else high = mid;
+    }}
 
-    sheet.style.transform = `translateX(-50%) scale(${{fit}})`;
+    const fit = Math.max(0.30, low * 0.997);
+    applyScale(sheet, fit);
     sheet.dataset.printFitScale = fit.toFixed(4);
   }}
 
   function scheduleFit() {{
     requestAnimationFrame(() => requestAnimationFrame(fitSheetToOnePage));
-    setTimeout(fitSheetToOnePage, 75);
-    setTimeout(fitSheetToOnePage, 250);
+    setTimeout(fitSheetToOnePage, 100);
+    setTimeout(fitSheetToOnePage, 350);
   }}
 
   if (document.readyState === 'complete') scheduleFit();
@@ -864,9 +890,17 @@ figcaption {{ font-size: 9px; color: {theme['muted']}; margin-top: 2px; }}
 .kind-pearl .pearl, .pearl {{ margin-top: 7px; padding: 6px 8px; border-left: 4px solid var(--accent); background: #F3F7FA; font-size: 11px; font-weight: 700; }}
 .kind-bottom_line {{ color: white; border-color: {theme['navy']}; background: {theme['navy']}; min-height: 48px; }}
 .bottom-inner {{ height: 100%; padding: 11px 16px; display: flex; gap: 12px; align-items: center; justify-content: center; text-align: center; }}
+.bottom-copy {{ flex: 1 1 auto; min-width: 0; display: flex; gap: 12px; align-items: center; justify-content: center; }}
 .bottom-inner strong {{ color: #FFD54A; font-size: 16px; text-transform: uppercase; white-space: nowrap; }}
 .bottom-inner span p {{ color: white; font-size: 13px; margin: 0; }}
-footer {{ background: {theme['footer_bg']}; color: {theme['footer_text']}; padding: 6px 12px; font-size: 9px; text-align: center; }}
+.kind-bottom_line figure {{ flex: 0 0 12%; }}
+.kind-bottom_line figure img {{ max-height: 58px; }}
+.kind-bottom_line figcaption {{ color: rgba(255,255,255,.82); }}
+.kind-bottom_line.graphic-left .bottom-inner {{ flex-direction: row-reverse; }}
+.kind-bottom_line.graphic-top .bottom-inner, .kind-bottom_line.graphic-full-width .bottom-inner {{ flex-direction: column-reverse; }}
+.kind-bottom_line.graphic-bottom .bottom-inner {{ flex-direction: column; }}
+.kind-bottom_line.graphic-top figure, .kind-bottom_line.graphic-bottom figure, .kind-bottom_line.graphic-full-width figure {{ flex-basis: auto; width: 100%; }}
+.kind-bottom_line.graphic-top figure img, .kind-bottom_line.graphic-bottom figure img, .kind-bottom_line.graphic-full-width figure img {{ max-height: 72px; max-width: 100%; }}
 @media (max-width: 760px) {{
   .page {{ aspect-ratio: auto; min-height: 900px; }}
   .grid {{ grid-template-columns: 1fr; }}
@@ -1323,7 +1357,7 @@ def build_pdf_reportlab(doc: Dict[str, Any]) -> bytes:
         if row_number < len(rows) - 1:
             story.append(Spacer(1, 6))
 
-    if doc.get("show_footer", True):
+    if False:  # Disclaimer/footer removed in v1.6.
         story.append(Spacer(1, 7))
         footer = Table([[Paragraph(prepare_inline_markup(str(doc.get("footer_text", ""))), footer_style)]], colWidths=[content_width])
         footer.setStyle(
@@ -1692,8 +1726,8 @@ def ai_prompt(doc: Dict[str, Any]) -> str:
         "orientation": "Landscape",
         "paper_size": "Letter",
         "show_numbers": True,
-        "show_footer": True,
-        "footer_text": "Clinical education guide - use clinical judgment and local policies.",
+        "show_footer": False,
+        "footer_text": "",
         "sections": [
             {
                 "title": "SECTION TITLE",
@@ -1747,6 +1781,8 @@ def init_state() -> None:
         st.session_state.cheat_doc = new_document("Troubleshooting guide")
     if "github_refresh" not in st.session_state:
         st.session_state.github_refresh = uuid.uuid4().hex
+    if "active_section_editor" not in st.session_state:
+        st.session_state.active_section_editor = None
 
 
 def set_document(doc: Dict[str, Any]) -> None:
@@ -1770,41 +1806,53 @@ def move_section(doc: Dict[str, Any], index: int, direction: int) -> None:
         doc["updated_at"] = utc_now_iso()
 
 
+def mark_section_active(section_id: str) -> None:
+    """Keep the section a user is editing open across Streamlit reruns."""
+    st.session_state.active_section_editor = section_id
+
+
 def render_section_editor(doc: Dict[str, Any], index: int) -> None:
     sec = doc["sections"][index]
     sec_id = sec["id"]
     kind_label = KIND_LABELS.get(sec.get("kind", "card"), "Teaching card")
 
-    with st.expander(f"{index + 1}. {sec.get('title', 'Untitled section')}  -  {kind_label}", expanded=index == 0):
+    active_id = st.session_state.get("active_section_editor")
+    keep_open = active_id == sec_id or (active_id is None and index == 0)
+    with st.expander(f"{index + 1}. {sec.get('title', 'Untitled section')}  -  {kind_label}", expanded=keep_open):
         top_cols = st.columns([1.1, 1.1, 1.1, 0.55, 0.55, 0.55])
-        sec["kind"] = SECTION_KINDS[top_cols[0].selectbox("Section style", list(SECTION_KINDS), index=list(SECTION_KINDS).index(kind_label), key=f"kind_{sec_id}")]
+        sec["kind"] = SECTION_KINDS[top_cols[0].selectbox("Section style", list(SECTION_KINDS), index=list(SECTION_KINDS).index(kind_label), key=f"kind_{sec_id}", on_change=mark_section_active, args=(sec_id,))]
         current_span_label = SPAN_LABELS.get(int(sec.get("span", 1)), "1 column")
-        sec["span"] = SPAN_OPTIONS[top_cols[1].selectbox("Width", list(SPAN_OPTIONS), index=list(SPAN_OPTIONS).index(current_span_label), key=f"span_{sec_id}")]
+        sec["span"] = SPAN_OPTIONS[top_cols[1].selectbox("Width", list(SPAN_OPTIONS), index=list(SPAN_OPTIONS).index(current_span_label), key=f"span_{sec_id}", on_change=mark_section_active, args=(sec_id,))]
         theme = THEMES[doc["theme_name"]]
         color_options = [f"Color {i + 1}" for i in range(len(theme["palette"]))]
         current_color = min(len(color_options) - 1, int(sec.get("accent_index", 0)) % len(color_options))
-        sec["accent_index"] = color_options.index(top_cols[2].selectbox("Accent", color_options, index=current_color, key=f"accent_{sec_id}"))
+        sec["accent_index"] = color_options.index(top_cols[2].selectbox("Accent", color_options, index=current_color, key=f"accent_{sec_id}", on_change=mark_section_active, args=(sec_id,)))
 
         if top_cols[3].button("Up", key=f"up_{sec_id}", disabled=index == 0, use_container_width=True):
+            mark_section_active(sec_id)
             move_section(doc, index, -1)
             st.rerun()
         if top_cols[4].button("Down", key=f"down_{sec_id}", disabled=index == len(doc["sections"]) - 1, use_container_width=True):
+            mark_section_active(sec_id)
             move_section(doc, index, 1)
             st.rerun()
         if top_cols[5].button("Delete", key=f"delete_{sec_id}", type="secondary", use_container_width=True):
+            st.session_state.active_section_editor = None
             doc["sections"].pop(index)
             doc["updated_at"] = utc_now_iso()
             st.rerun()
 
-        sec["title"] = st.text_input("Section title", value=str(sec.get("title", "")), key=f"title_{sec_id}")
+        sec["title"] = st.text_input("Section title", value=str(sec.get("title", "")), key=f"title_{sec_id}", on_change=mark_section_active, args=(sec_id,))
         sec["body"] = st.text_area(
             "Content",
             value=str(sec.get("body", "")),
             height=180,
             key=f"body_{sec_id}",
             help="Use one idea per line. Begin bullet lines with '- '. Use **bold** for emphasis.",
+            on_change=mark_section_active,
+            args=(sec_id,),
         )
-        sec["pearl"] = st.text_input("Optional pearl / callout", value=str(sec.get("pearl", "")), key=f"pearl_{sec_id}")
+        sec["pearl"] = st.text_input("Optional pearl / callout", value=str(sec.get("pearl", "")), key=f"pearl_{sec_id}", on_change=mark_section_active, args=(sec_id,))
 
         with st.expander("Graphic options", expanded=bool(sec.get("graphic_b64"))):
             graphic_cols = st.columns([1.3, 1, 1])
@@ -1812,6 +1860,8 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
                 "Upload a suggested graphic",
                 type=["png", "jpg", "jpeg", "webp"],
                 key=f"graphic_upload_{sec_id}",
+                on_change=mark_section_active,
+                args=(sec_id,),
             )
             if upload is not None:
                 raw = upload.getvalue()
@@ -1831,8 +1881,11 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
                 GRAPHIC_POSITIONS,
                 index=GRAPHIC_POSITIONS.index(sec.get("graphic_position", "Right")) if sec.get("graphic_position", "Right") in GRAPHIC_POSITIONS else 0,
                 key=f"graphic_position_{sec_id}",
+                on_change=mark_section_active,
+                args=(sec_id,),
             )
             if graphic_cols[2].button("Remove graphic", key=f"remove_graphic_{sec_id}", disabled=not bool(sec.get("graphic_b64")), use_container_width=True):
+                mark_section_active(sec_id)
                 for field in ["graphic_b64", "graphic_name", "graphic_mime", "graphic_caption", "graphic_hash"]:
                     sec[field] = ""
                 st.rerun()
@@ -1841,6 +1894,8 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
                 value=str(sec.get("graphic_caption", "")),
                 key=f"graphic_caption_{sec_id}",
                 help="This can also hold a suggested visual description until you upload the final graphic.",
+                on_change=mark_section_active,
+                args=(sec_id,),
             )
             if sec.get("graphic_b64"):
                 st.image(base64.b64decode(sec["graphic_b64"]), caption=sec.get("graphic_name", "Uploaded graphic"), width=240)
@@ -1851,6 +1906,8 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
                 value=str(sec.get("custom_accent", "")),
                 placeholder="#0B57A4",
                 key=f"custom_accent_{sec_id}",
+                on_change=mark_section_active,
+                args=(sec_id,),
             )
 
 
@@ -1909,9 +1966,9 @@ def main() -> None:
             doc["orientation"] = page_cols[0].selectbox("Orientation", ["Landscape", "Portrait"], index=0 if doc.get("orientation") == "Landscape" else 1)
             doc["paper_size"] = page_cols[1].selectbox("Paper", ["Letter", "A4"], index=0 if doc.get("paper_size") == "Letter" else 1)
             doc["show_numbers"] = st.checkbox("Number sections", value=bool(doc.get("show_numbers", True)))
-            doc["show_footer"] = st.checkbox("Show footer disclaimer", value=bool(doc.get("show_footer", True)))
-            if doc["show_footer"]:
-                doc["footer_text"] = st.text_area("Footer text", value=str(doc.get("footer_text", "")), height=82)
+            # Footer/disclaimer intentionally removed from the builder and exports.
+            doc["show_footer"] = False
+            doc["footer_text"] = ""
 
             st.divider()
             if st.button("Add section", type="primary", use_container_width=True):
@@ -1928,7 +1985,7 @@ def main() -> None:
                 set_document(new_document("Blank canvas"))
                 st.rerun()
 
-            st.info("For the cleanest one-page result, keep each card concise. Longer guides will automatically continue onto additional PDF pages.")
+            st.info("PDF export automatically fits the completed cheat sheet onto one page while preserving the full page width.")
 
         with editor_col:
             st.subheader("Sections")
