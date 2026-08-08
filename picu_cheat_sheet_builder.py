@@ -1,5 +1,5 @@
 """
-PICU Cheat Sheet Builder v1.6
+PICU Cheat Sheet Builder v1.7
 ============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
@@ -166,7 +166,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 SCHEMA_VERSION = 1
 
 # The Streamlit preview is intentionally designed around this visual canvas width.
@@ -257,7 +257,7 @@ SECTION_KINDS = {
     "Step / algorithm": "step",
     "Warning / pitfall": "warning",
     "Clinical pearl": "pearl",
-    "Bottom line banner": "bottom_line",
+    "Bottom line": "bottom_line",
 }
 KIND_LABELS = {value: key for key, value in SECTION_KINDS.items()}
 
@@ -422,7 +422,7 @@ def new_document(template_name: str = "Troubleshooting guide") -> Dict[str, Any]
         "author": "",
         "template_name": template_name,
         "theme_name": "Classic PICU",
-        "orientation": "Landscape",
+        "orientation": "Portrait",
         "paper_size": "Letter",
         "show_numbers": True,
         "show_footer": False,
@@ -466,7 +466,7 @@ def normalize_document(raw: Dict[str, Any]) -> Dict[str, Any]:
     if base.get("theme_name") not in THEMES:
         base["theme_name"] = "Classic PICU"
     if base.get("orientation") not in {"Landscape", "Portrait"}:
-        base["orientation"] = "Landscape"
+        base["orientation"] = "Portrait"
     if base.get("paper_size") not in {"Letter", "A4"}:
         base["paper_size"] = "Letter"
     # v1.6 intentionally removes the clinical disclaimer/footer from the sheet.
@@ -617,7 +617,7 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
     approved on screen.
     """
     theme = THEMES[doc["theme_name"]]
-    orientation = doc.get("orientation", "Landscape")
+    orientation = doc.get("orientation", "Portrait")
     aspect = "11 / 8.5" if orientation == "Landscape" else "8.5 / 11"
     sections_html: List[str] = []
 
@@ -640,13 +640,16 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
         classes = f"card kind-{kind} graphic-{position}"
         style_vars = f"grid-column: span {span}; --span:{span}; --accent:{accent}; --tint:{tint};"
         if kind == "bottom_line":
-            # Bottom-line banners support graphics too. Earlier versions rendered
-            # only the text because this special branch skipped image_html.
+            # Treat the bottom line as a true section: a dedicated navy header,
+            # with text and/or an uploaded graphic in a separate white body below.
+            # The graphic is intentionally stacked beneath the text regardless of
+            # the generic graphic-placement selector so it never gets embedded in
+            # the header/banner itself.
             sections_html.append(
                 f"<section class='{classes}' style='{style_vars}'>"
-                f"<div class='bottom-inner'><div class='bottom-copy'>"
-                f"<strong>{html.escape(str(sec.get('title', 'Bottom line')))}</strong>"
-                f"<span>{body_html}</span></div>{image_html}</div></section>"
+                f"<header><span>{html.escape(str(sec.get('title', 'Bottom line')).upper())}</span></header>"
+                f"<div class='card-content bottom-line-content'><div class='text'>{body_html}{pearl_html}</div>{image_html}</div>"
+                f"</section>"
             )
         else:
             sections_html.append(
@@ -768,13 +771,12 @@ figcaption {{ font-size: {px(9)} !important; margin-top: {px(2)} !important; }}
   border-left-width: {px(4)} !important;
   font-size: {px(11)} !important;
 }}
-.kind-bottom_line {{ min-height: {px(48)} !important; }}
-.bottom-inner {{ padding: {px(11)} {px(16)} !important; gap: {px(12)} !important; }}
-.bottom-copy {{ gap: {px(12)} !important; }}
-.bottom-inner strong {{ font-size: {px(16)} !important; }}
-.bottom-inner span p {{ font-size: {px(13)} !important; }}
-.kind-bottom_line figure img {{ max-height: {px(58)} !important; }}
-.kind-bottom_line figcaption {{ font-size: {px(8)} !important; }}
+.kind-bottom_line {{ min-height: {px(82)} !important; }}
+.kind-bottom_line header {{ min-height: {px(35)} !important; padding: {px(7)} {px(10)} !important; font-size: {px(16)} !important; }}
+.kind-bottom_line .bottom-line-content {{ gap: {px(7)} !important; padding: {px(9)} {px(11)} {px(10)} !important; }}
+.kind-bottom_line .bottom-line-content p {{ font-size: {px(13)} !important; margin-bottom: {px(5)} !important; }}
+.kind-bottom_line figure img {{ max-height: {px(105)} !important; max-width: 96% !important; }}
+.kind-bottom_line figcaption {{ font-size: {px(9)} !important; }}
 .title, .card, .card header, .badge, .pearl, .kind-bottom_line {{
   -webkit-print-color-adjust: exact !important;
   print-color-adjust: exact !important;
@@ -888,19 +890,15 @@ figcaption {{ font-size: 9px; color: {theme['muted']}; margin-top: 2px; }}
 .kind-formula .card-content {{ background: var(--tint); }}
 .kind-formula p {{ font-size: 14px; font-weight: 600; }}
 .kind-pearl .pearl, .pearl {{ margin-top: 7px; padding: 6px 8px; border-left: 4px solid var(--accent); background: #F3F7FA; font-size: 11px; font-weight: 700; }}
-.kind-bottom_line {{ color: white; border-color: {theme['navy']}; background: {theme['navy']}; min-height: 48px; }}
-.bottom-inner {{ height: 100%; padding: 11px 16px; display: flex; gap: 12px; align-items: center; justify-content: center; text-align: center; }}
-.bottom-copy {{ flex: 1 1 auto; min-width: 0; display: flex; gap: 12px; align-items: center; justify-content: center; }}
-.bottom-inner strong {{ color: #FFD54A; font-size: 16px; text-transform: uppercase; white-space: nowrap; }}
-.bottom-inner span p {{ color: white; font-size: 13px; margin: 0; }}
-.kind-bottom_line figure {{ flex: 0 0 12%; }}
-.kind-bottom_line figure img {{ max-height: 58px; }}
-.kind-bottom_line figcaption {{ color: rgba(255,255,255,.82); }}
-.kind-bottom_line.graphic-left .bottom-inner {{ flex-direction: row-reverse; }}
-.kind-bottom_line.graphic-top .bottom-inner, .kind-bottom_line.graphic-full-width .bottom-inner {{ flex-direction: column-reverse; }}
-.kind-bottom_line.graphic-bottom .bottom-inner {{ flex-direction: column; }}
-.kind-bottom_line.graphic-top figure, .kind-bottom_line.graphic-bottom figure, .kind-bottom_line.graphic-full-width figure {{ flex-basis: auto; width: 100%; }}
-.kind-bottom_line.graphic-top figure img, .kind-bottom_line.graphic-bottom figure img, .kind-bottom_line.graphic-full-width figure img {{ max-height: 72px; max-width: 100%; }}
+.kind-bottom_line {{ border-color: {theme['navy']}; background: {theme['card_bg']}; min-height: 82px; }}
+.kind-bottom_line header {{ background: {theme['navy']}; color: white; justify-content: center; text-transform: uppercase; letter-spacing: .2px; }}
+.kind-bottom_line .bottom-line-content {{ flex-direction: column !important; align-items: stretch !important; text-align: center; gap: 7px; }}
+.kind-bottom_line .bottom-line-content .text {{ flex: 0 0 auto; width: 100%; }}
+.kind-bottom_line .bottom-line-content p {{ color: {theme['text']}; font-size: 13px; font-weight: 700; margin: 0 0 5px; text-align: center; }}
+.kind-bottom_line .bottom-line-content ul {{ text-align: left; display: inline-block; margin-left: 22px; }}
+.kind-bottom_line figure {{ flex: 0 0 auto !important; width: 100%; text-align: center; }}
+.kind-bottom_line figure img {{ max-height: 105px; max-width: 96%; }}
+.kind-bottom_line figcaption {{ color: {theme['muted']}; }}
 @media (max-width: 760px) {{
   .page {{ aspect-ratio: auto; min-height: 900px; }}
   .grid {{ grid-template-columns: 1fr; }}
@@ -1049,27 +1047,52 @@ def make_card(sec: Dict[str, Any], idx: int, width: float, theme: Dict[str, Any]
 
     if kind == "bottom_line":
         label = prepare_inline_markup(str(sec.get("title", "Bottom line")).upper())
-        body = prepare_inline_markup(str(sec.get("body", "")))
-        bottom_style = ParagraphStyle(
-            "bottom_line",
-            parent=styles["Normal"],
-            fontName="Helvetica-Bold",
+        header_style = ParagraphStyle(
+            "bottom_line_header",
+            parent=title_style,
+            alignment=TA_CENTER,
             fontSize=9.2,
-            leading=11,
-            textColor=colors.white,
+            leading=10.6,
+        )
+        bottom_body_style = ParagraphStyle(
+            "bottom_line_body",
+            parent=body_style,
+            fontName="Helvetica-Bold",
+            fontSize=max(7.8, body_size),
+            leading=max(9.4, body_size + 1.8),
             alignment=TA_CENTER,
         )
-        content = Paragraph(f"<font color='#FFD54A'>{label}:</font> {body}", bottom_style)
-        table = Table([[content]], colWidths=[width], hAlign="LEFT")
+        header = Paragraph(f"<font color='#FFFFFF'><b>{label}</b></font>", header_style)
+        body_items = body_flowables(str(sec.get("body", "")), bottom_body_style, bullet_style)
+        if sec.get("pearl"):
+            body_items.append(Paragraph(prepare_inline_markup(str(sec.get("pearl", ""))), pearl_style))
+
+        image = image_flowable(sec, min(width * 0.88, 330), 120)
+        if image:
+            if body_items:
+                body_items.append(Spacer(1, 4))
+            body_items.append(image)
+            if sec.get("graphic_caption"):
+                body_items.extend([Spacer(1, 2), Paragraph(prepare_inline_markup(str(sec.get("graphic_caption", ""))), caption_style)])
+
+        if not body_items:
+            body_items = [Spacer(1, 2)]
+
+        table = Table([[header], [body_items]], colWidths=[width], hAlign="LEFT")
         table.setStyle(
             TableStyle(
                 [
-                    ("BACKGROUND", (0, 0), (-1, -1), navy),
-                    ("BOX", (0, 0), (-1, -1), 1.2, navy),
-                    ("LEFTPADDING", (0, 0), (-1, -1), 9),
-                    ("RIGHTPADDING", (0, 0), (-1, -1), 9),
-                    ("TOPPADDING", (0, 0), (-1, -1), 7),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                    ("BACKGROUND", (0, 0), (0, 0), navy),
+                    ("BACKGROUND", (0, 1), (0, 1), card_bg),
+                    ("BOX", (0, 0), (-1, -1), 1.0, navy),
+                    ("LEFTPADDING", (0, 0), (0, 0), 8),
+                    ("RIGHTPADDING", (0, 0), (0, 0), 8),
+                    ("TOPPADDING", (0, 0), (0, 0), 6),
+                    ("BOTTOMPADDING", (0, 0), (0, 0), 6),
+                    ("LEFTPADDING", (0, 1), (0, 1), 9),
+                    ("RIGHTPADDING", (0, 1), (0, 1), 9),
+                    ("TOPPADDING", (0, 1), (0, 1), 7),
+                    ("BOTTOMPADDING", (0, 1), (0, 1), 7),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ]
             )
@@ -1170,7 +1193,7 @@ def pack_section_rows(sections: Sequence[Dict[str, Any]], total_columns: int = 3
 
 def page_dimensions(doc: Dict[str, Any]) -> Tuple[float, float]:
     base = letter if doc.get("paper_size", "Letter") == "Letter" else A4
-    return landscape(base) if doc.get("orientation", "Landscape") == "Landscape" else portrait(base)
+    return landscape(base) if doc.get("orientation", "Portrait") == "Landscape" else portrait(base)
 
 
 def build_pdf_chromium(doc: Dict[str, Any]) -> bytes:
@@ -1723,7 +1746,7 @@ def ai_prompt(doc: Dict[str, Any]) -> str:
         "subtitle": "SUBTITLE",
         "template_name": doc.get("template_name", "Blank canvas"),
         "theme_name": doc.get("theme_name", "Classic PICU"),
-        "orientation": "Landscape",
+        "orientation": "Portrait",
         "paper_size": "Letter",
         "show_numbers": True,
         "show_footer": False,
@@ -1856,10 +1879,21 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
 
         with st.expander("Graphic options", expanded=bool(sec.get("graphic_b64"))):
             graphic_cols = st.columns([1.3, 1, 1])
+
+            # Streamlit's file_uploader retains the selected file across reruns. If we
+            # only clear graphic_b64, the retained upload is immediately read again on
+            # the next rerun and the graphic appears to "come back." A per-section
+            # nonce gives the uploader a fresh widget key whenever Remove graphic is
+            # pressed, which truly resets the uploader while leaving normal reruns alone.
+            uploader_nonce_key = f"graphic_upload_nonce_{sec_id}"
+            if uploader_nonce_key not in st.session_state:
+                st.session_state[uploader_nonce_key] = 0
+            uploader_widget_key = f"graphic_upload_{sec_id}_{st.session_state[uploader_nonce_key]}"
+
             upload = graphic_cols[0].file_uploader(
                 "Upload a suggested graphic",
                 type=["png", "jpg", "jpeg", "webp"],
-                key=f"graphic_upload_{sec_id}",
+                key=uploader_widget_key,
                 on_change=mark_section_active,
                 args=(sec_id,),
             )
@@ -1876,18 +1910,35 @@ def render_section_editor(doc: Dict[str, Any], index: int) -> None:
                         sec["graphic_hash"] = digest
                     except Exception as exc:
                         st.error(f"That file could not be read as an image: {exc}")
-            sec["graphic_position"] = graphic_cols[1].selectbox(
-                "Placement",
-                GRAPHIC_POSITIONS,
-                index=GRAPHIC_POSITIONS.index(sec.get("graphic_position", "Right")) if sec.get("graphic_position", "Right") in GRAPHIC_POSITIONS else 0,
-                key=f"graphic_position_{sec_id}",
-                on_change=mark_section_active,
-                args=(sec_id,),
-            )
+            if sec.get("kind") == "bottom_line":
+                # Bottom-line content is intentionally stacked beneath its header.
+                # Lock the graphic there so the editor matches the rendered result.
+                sec["graphic_position"] = "Bottom"
+                graphic_cols[1].selectbox(
+                    "Placement",
+                    ["Below header"],
+                    index=0,
+                    key=f"bottom_graphic_position_{sec_id}",
+                    disabled=True,
+                    help="Bottom-line graphics always appear below the BOTTOM LINE header (and below any bottom-line text).",
+                )
+            else:
+                sec["graphic_position"] = graphic_cols[1].selectbox(
+                    "Placement",
+                    GRAPHIC_POSITIONS,
+                    index=GRAPHIC_POSITIONS.index(sec.get("graphic_position", "Right")) if sec.get("graphic_position", "Right") in GRAPHIC_POSITIONS else 0,
+                    key=f"graphic_position_{sec_id}",
+                    on_change=mark_section_active,
+                    args=(sec_id,),
+                )
             if graphic_cols[2].button("Remove graphic", key=f"remove_graphic_{sec_id}", disabled=not bool(sec.get("graphic_b64")), use_container_width=True):
                 mark_section_active(sec_id)
                 for field in ["graphic_b64", "graphic_name", "graphic_mime", "graphic_caption", "graphic_hash"]:
                     sec[field] = ""
+                # Force a brand-new file_uploader on the next rerun so Streamlit does
+                # not repopulate the just-removed graphic from the previous upload.
+                st.session_state[uploader_nonce_key] = int(st.session_state.get(uploader_nonce_key, 0)) + 1
+                doc["updated_at"] = utc_now_iso()
                 st.rerun()
             sec["graphic_caption"] = st.text_input(
                 "Graphic caption or AI suggestion",
@@ -1963,7 +2014,7 @@ def main() -> None:
                 key="theme_name",
             )
             page_cols = st.columns(2)
-            doc["orientation"] = page_cols[0].selectbox("Orientation", ["Landscape", "Portrait"], index=0 if doc.get("orientation") == "Landscape" else 1)
+            doc["orientation"] = page_cols[0].selectbox("Orientation", ["Portrait", "Landscape"], index=0 if doc.get("orientation", "Portrait") == "Portrait" else 1)
             doc["paper_size"] = page_cols[1].selectbox("Paper", ["Letter", "A4"], index=0 if doc.get("paper_size") == "Letter" else 1)
             doc["show_numbers"] = st.checkbox("Number sections", value=bool(doc.get("show_numbers", True)))
             # Footer/disclaimer intentionally removed from the builder and exports.
@@ -1985,7 +2036,7 @@ def main() -> None:
                 set_document(new_document("Blank canvas"))
                 st.rerun()
 
-            st.info("PDF export automatically fits the completed cheat sheet onto one page while preserving the full page width.")
+            st.info("Portrait is the default. PDF export automatically fits the completed cheat sheet onto one page while preserving the full page width.")
 
         with editor_col:
             st.subheader("Sections")
