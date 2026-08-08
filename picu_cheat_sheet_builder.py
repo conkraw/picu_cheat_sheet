@@ -1,5 +1,5 @@
 """
-PICU Cheat Sheet Builder v1.4
+PICU Cheat Sheet Builder v1.5
 ============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
@@ -14,7 +14,7 @@ Core features
 - Section-level graphics (PNG/JPG/WebP), captions, colors, and column spans
 - JSON import/export for AI-assisted drafting
 - User-controlled GitHub JSON filenames plus archive save/load/delete using the GitHub Contents API
-- Pixel-faithful PDF export using headless Chromium and the exact same HTML/CSS as the preview
+- Pixel-faithful one-page PDF export using headless Chromium and the exact same HTML/CSS as the preview
 - WeasyPrint secondary renderer and ReportLab emergency fallback
 
 Install
@@ -166,7 +166,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 SCHEMA_VERSION = 1
 
 # The Streamlit preview is intentionally designed around this visual canvas width.
@@ -654,6 +654,7 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
         footer_html = f"<footer>{html.escape(str(doc.get('footer_text', '')))}</footer>"
 
     pdf_css = ""
+    pdf_fit_script = ""
     if for_pdf:
         is_letter = doc.get("paper_size", "Letter") == "Letter"
         if is_letter and orientation == "Landscape":
@@ -687,17 +688,28 @@ html, body {{
   margin: 0 !important;
   padding: 0 !important;
   width: {page_w};
-  min-height: {page_h};
+  height: {page_h};
+  min-height: 0 !important;
+  max-height: {page_h};
   background: {theme['page_bg']};
+  overflow: hidden !important;
   -webkit-print-color-adjust: exact !important;
   print-color-adjust: exact !important;
 }}
-body {{ overflow: visible; }}
+body {{
+  position: relative;
+}}
 .page {{
   width: {page_w};
+  height: {page_h};
   min-height: {page_h};
   max-width: none;
   margin: 0;
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform-origin: top center;
+  transform: translateX(-50%) scale(1);
   aspect-ratio: auto;
   box-shadow: none;
   overflow: visible;
@@ -766,6 +778,55 @@ footer {{
 }}
 """
 
+        # Chromium lays out the exact preview-proportioned sheet first. If that
+        # natural layout is taller than one physical page, this tiny browser-side
+        # fitting pass uniformly scales the COMPLETE sheet (title, cards, graphics,
+        # bottom line, and footer) just enough to fit. The page stays a single PDF
+        # page instead of allowing Chromium to push the last row onto page 2.
+        target_height_px = max(1.0, page_h_px - 2.0)
+        pdf_fit_script = f"""
+<script>
+(function () {{
+  const TARGET_HEIGHT = {target_height_px:.2f};
+
+  function fitSheetToOnePage() {{
+    const sheet = document.querySelector('.page');
+    if (!sheet) return;
+
+    // Measure at the approved preview proportions before applying any fit.
+    sheet.style.transform = 'translateX(-50%) scale(1)';
+    const naturalHeight = Math.max(
+      sheet.scrollHeight || 0,
+      sheet.offsetHeight || 0,
+      sheet.getBoundingClientRect().height || 0
+    );
+
+    // A tiny safety factor prevents fractional-pixel rounding from creating a
+    // nearly-empty second PDF page. Only shrink when the content actually needs it.
+    const fit = naturalHeight > TARGET_HEIGHT
+      ? Math.max(0.01, (TARGET_HEIGHT / naturalHeight) * 0.995)
+      : 1;
+
+    sheet.style.transform = `translateX(-50%) scale(${{fit}})`;
+    sheet.dataset.printFitScale = fit.toFixed(4);
+  }}
+
+  function scheduleFit() {{
+    requestAnimationFrame(() => requestAnimationFrame(fitSheetToOnePage));
+    setTimeout(fitSheetToOnePage, 75);
+    setTimeout(fitSheetToOnePage, 250);
+  }}
+
+  if (document.readyState === 'complete') scheduleFit();
+  else window.addEventListener('load', scheduleFit, {{ once: true }});
+
+  if (document.fonts && document.fonts.ready) {{
+    document.fonts.ready.then(scheduleFit).catch(() => {{}});
+  }}
+}})();
+</script>
+"""
+
     return f"""
 <!DOCTYPE html>
 <html>
@@ -820,6 +881,7 @@ footer {{ background: {theme['footer_bg']}; color: {theme['footer_text']}; paddi
   <main class="grid">{''.join(sections_html)}</main>
   {footer_html}
 </div>
+{pdf_fit_script}
 </body>
 </html>
 """
@@ -1304,7 +1366,7 @@ def build_pdf_with_engine(doc: Dict[str, Any]) -> Tuple[bytes, str, str]:
     failures: List[str] = []
 
     try:
-        return build_pdf_chromium(doc), "Chromium (preview-faithful)", "Rendered in Chromium with print geometry scaled from the same 760px design canvas used by the preview."
+        return build_pdf_chromium(doc), "Chromium (preview-faithful)", "Rendered in Chromium from the same 760px design canvas used by the preview, with automatic whole-sheet fitting to keep the finalized cheat sheet on one physical PDF page."
     except Exception as exc:
         failures.append(f"Chromium: {exc}")
 
@@ -1907,7 +1969,7 @@ def main() -> None:
         download_cols[2].button("Refresh preview", use_container_width=True)
         chrome_ok, chrome_detail = chromium_status()
         if pdf_engine_name.startswith("Chromium"):
-            st.success("PDF engine: Chromium - preview-proportioned export. The PDF preserves the preview grid, line wrapping, typography scale, spacing, colors, and card geometry.")
+            st.success("PDF engine: Chromium - preview-proportioned one-page export. The PDF preserves the preview grid, colors, spacing, and card geometry, then uniformly fits the complete sheet only if needed to keep it on one physical page.")
         elif pdf_engine_name.startswith("WeasyPrint"):
             st.warning("PDF engine: WeasyPrint fallback. This uses the same HTML/CSS, but it is not the same browser renderer as the preview, so small layout differences can remain.")
         elif pdf_engine_name.startswith("ReportLab"):
