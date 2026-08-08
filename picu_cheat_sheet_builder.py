@@ -1,6 +1,6 @@
 """
-PICU Cheat Sheet Builder
-========================
+PICU Cheat Sheet Builder v1.3
+============================
 
 A single-file Streamlit app for building visual, one-page clinical guides in a
 consistent PICU teaching style.
@@ -14,12 +14,14 @@ Core features
 - Section-level graphics (PNG/JPG/WebP), captions, colors, and column spans
 - JSON import/export for AI-assisted drafting
 - User-controlled GitHub JSON filenames plus archive save/load/delete using the GitHub Contents API
-- Preview-matched PDF export using the same HTML/CSS layout (WeasyPrint)
-- ReportLab fallback PDF export if WeasyPrint is unavailable
+- Pixel-faithful PDF export using headless Chromium and the exact same HTML/CSS as the preview
+- WeasyPrint secondary renderer and ReportLab emergency fallback
 
 Install
 -------
 pip install streamlit reportlab pillow requests weasyprint
+
+For Streamlit Community Cloud, add `chromium` to packages.txt for pixel-faithful PDF export.
 
 Run
 ---
@@ -44,6 +46,9 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import textwrap
 import uuid
 from datetime import datetime, timezone
@@ -67,6 +72,54 @@ except Exception as exc:  # pragma: no cover - depends on deployment environment
     WEASYPRINT_IMPORT_ERROR = exc
 
 
+def find_chromium_binary() -> Optional[str]:
+    """Find a Chromium/Chrome executable available on the deployment."""
+    candidates = [
+        os.environ.get("CHROME_BIN", ""),
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        else:
+            found = shutil.which(candidate)
+            if found:
+                return found
+    return None
+
+
+def chromium_status() -> Tuple[bool, str]:
+    """Return whether the browser renderer used for pixel-faithful PDF is available."""
+    binary = find_chromium_binary()
+    if not binary:
+        return False, "Chromium/Chrome executable was not found. Add `chromium` to Streamlit Community Cloud packages.txt."
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        version = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            return False, f"Chromium was found at {binary}, but `--version` failed: {version or 'unknown error'}"
+        return True, f"Browser PDF engine ready: {version or binary}"
+    except Exception as exc:
+        return False, f"Chromium was found at {binary}, but could not be executed: {exc}"
+
+
 def weasyprint_status() -> Tuple[bool, str]:
     """Return whether the preview-matched PDF engine is actually usable.
 
@@ -87,13 +140,15 @@ def weasyprint_status() -> Tuple[bool, str]:
 
 
 def render_preview(preview_html: str, height: int = 900) -> None:
-    """Render preview with the current Streamlit API, with a legacy fallback."""
-    if hasattr(st, "iframe"):
-        st.iframe(preview_html, height=height, width="stretch")
-    elif components is not None:
-        components.html(preview_html, height=height, scrolling=True)
-    else:
+    """Render the preview from the same HTML string used by the browser PDF engine."""
+    # st.html accepts an HTML string directly and is the supported replacement for
+    # the deprecated components.v1.html API in current Streamlit releases.
+    try:
+        st.html(preview_html, width="stretch")
+    except TypeError:
         st.html(preview_html)
+
+
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, letter, landscape, portrait
@@ -607,11 +662,31 @@ def build_preview_html(doc: Dict[str, Any], for_pdf: bool = False) -> str:
 
         pdf_css = f"""
 @page {{ size: {page_rule}; margin: 0; }}
-html, body {{ margin: 0 !important; padding: 0 !important; width: {page_w}; min-height: {page_h}; background: {theme['page_bg']}; }}
+html, body {{
+  margin: 0 !important;
+  padding: 0 !important;
+  width: {page_w};
+  min-height: {page_h};
+  background: {theme['page_bg']};
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
+}}
 body {{ overflow: visible; }}
-.page {{ width: {page_w}; min-height: {page_h}; max-width: none; margin: 0; aspect-ratio: auto; box-shadow: none; overflow: visible; padding-bottom: 24px; }}
+.page {{
+  width: {page_w};
+  min-height: {page_h};
+  max-width: none;
+  margin: 0;
+  aspect-ratio: auto;
+  box-shadow: none;
+  overflow: visible;
+}}
+.title, .card, .card header, .badge, .pearl, .kind-bottom_line, footer {{
+  -webkit-print-color-adjust: exact !important;
+  print-color-adjust: exact !important;
+}}
 .card {{ break-inside: avoid; page-break-inside: avoid; }}
-footer {{ position: fixed; left: 0; right: 0; bottom: 0; z-index: 999; }}
+footer {{ position: static; margin-top: auto; }}
 """
 
     return f"""
@@ -925,6 +1000,82 @@ def page_dimensions(doc: Dict[str, Any]) -> Tuple[float, float]:
     return landscape(base) if doc.get("orientation", "Landscape") == "Landscape" else portrait(base)
 
 
+def build_pdf_chromium(doc: Dict[str, Any]) -> bytes:
+    """Print the exact preview HTML with headless Chromium.
+
+    This is the preferred renderer because the on-screen preview is rendered by
+    a browser too. Using the same HTML/CSS in Chromium preserves CSS Grid,
+    rounded corners, badges, spacing, colors, graphics, and typography much more
+    faithfully than reconstructing the layout with a PDF drawing library.
+    """
+    binary = find_chromium_binary()
+    if not binary:
+        raise RuntimeError("Chromium/Chrome is not installed. Add `chromium` to packages.txt.")
+
+    html_source = build_preview_html(doc, for_pdf=True)
+    with tempfile.TemporaryDirectory(prefix="picu_cheat_pdf_") as tmp:
+        tmp_path = os.path.abspath(tmp)
+        html_path = os.path.join(tmp_path, "preview.html")
+        pdf_path = os.path.join(tmp_path, "preview.pdf")
+        profile_path = os.path.join(tmp_path, "chrome-profile")
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html_source)
+
+        page_url = "file://" + html_path
+        common = [
+            binary,
+            "--headless",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--hide-scrollbars",
+            "--run-all-compositor-stages-before-draw",
+            "--virtual-time-budget=750",
+            f"--user-data-dir={profile_path}",
+            f"--print-to-pdf={pdf_path}",
+        ]
+
+        # Current Chromium uses --no-pdf-header-footer. Older Debian Chromium
+        # builds used --print-to-pdf-no-header. Try both for deployment parity.
+        attempts = [
+            common + ["--no-pdf-header-footer", page_url],
+            common + ["--print-to-pdf-no-header", page_url],
+        ]
+        errors: List[str] = []
+        for cmd in attempts:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=45,
+                    check=False,
+                    env={**os.environ, "HOME": tmp_path},
+                )
+                if proc.returncode == 0 and os.path.exists(pdf_path):
+                    pdf = open(pdf_path, "rb").read()
+                    if pdf.startswith(b"%PDF") and len(pdf) > 1000:
+                        return pdf
+                errors.append((proc.stdout or "").strip() or f"exit code {proc.returncode}")
+            except Exception as exc:
+                errors.append(str(exc))
+
+        raise RuntimeError("Chromium PDF rendering failed: " + " | ".join(errors[-2:]))
+
+
+def build_pdf_weasyprint(doc: Dict[str, Any]) -> bytes:
+    """Secondary HTML/CSS renderer when Chromium is unavailable."""
+    if WeasyHTML is None:
+        raise RuntimeError(str(WEASYPRINT_IMPORT_ERROR or "WeasyPrint is unavailable"))
+    html_source = build_preview_html(doc, for_pdf=True)
+    pdf = WeasyHTML(string=html_source, base_url=os.getcwd()).write_pdf()
+    if not pdf or not pdf.startswith(b"%PDF"):
+        raise RuntimeError("WeasyPrint did not return a valid PDF.")
+    return pdf
+
+
 def build_pdf_reportlab(doc: Dict[str, Any]) -> bytes:
     buffer = io.BytesIO()
     page_size = page_dimensions(doc)
@@ -1062,22 +1213,36 @@ def build_pdf_reportlab(doc: Dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
-def build_pdf(doc: Dict[str, Any]) -> bytes:
-    """Create a PDF that visually matches the on-screen preview when possible.
+def build_pdf_with_engine(doc: Dict[str, Any]) -> Tuple[bytes, str, str]:
+    """Render PDF and report which engine actually created it.
 
-    WeasyPrint renders the same HTML/CSS used by the preview. If the deployment
-    lacks WeasyPrint's native Linux libraries, the legacy ReportLab renderer is
-    still available so the user can export rather than losing PDF functionality.
+    Order is intentional:
+      1) Chromium = browser-to-browser fidelity; preferred.
+      2) WeasyPrint = HTML/CSS fallback.
+      3) ReportLab = emergency fallback only.
+
+    Unlike the previous version, failures are not silently hidden. The returned
+    detail tells the UI exactly why a lower-fidelity fallback was used.
     """
-    if WeasyHTML is not None:
-        try:
-            html_source = build_preview_html(doc, for_pdf=True)
-            pdf = WeasyHTML(string=html_source, base_url=os.getcwd()).write_pdf()
-            if pdf and pdf.startswith(b"%PDF"):
-                return pdf
-        except Exception:
-            pass
-    return build_pdf_reportlab(doc)
+    failures: List[str] = []
+
+    try:
+        return build_pdf_chromium(doc), "Chromium (preview-faithful)", "Rendered with the same browser HTML/CSS used for the preview."
+    except Exception as exc:
+        failures.append(f"Chromium: {exc}")
+
+    try:
+        return build_pdf_weasyprint(doc), "WeasyPrint (HTML/CSS fallback)", "Chromium was unavailable; WeasyPrint rendered the same HTML/CSS. " + " | ".join(failures)
+    except Exception as exc:
+        failures.append(f"WeasyPrint: {exc}")
+
+    pdf = build_pdf_reportlab(doc)
+    return pdf, "ReportLab (legacy fallback)", " | ".join(failures)
+
+
+def build_pdf(doc: Dict[str, Any]) -> bytes:
+    """Backward-compatible helper used elsewhere in the app."""
+    return build_pdf_with_engine(doc)[0]
 
 
 # -----------------------------------------------------------------------------
@@ -1640,8 +1805,10 @@ def main() -> None:
 
         st.subheader("Download finalized files")
         download_cols = st.columns(3)
+        pdf_engine_name = "Unavailable"
+        pdf_engine_detail = ""
         try:
-            pdf_bytes = build_pdf(doc)
+            pdf_bytes, pdf_engine_name, pdf_engine_detail = build_pdf_with_engine(doc)
             download_cols[0].download_button(
                 "Download PDF",
                 data=pdf_bytes,
@@ -1651,6 +1818,7 @@ def main() -> None:
                 use_container_width=True,
             )
         except Exception as exc:
+            pdf_engine_detail = str(exc)
             download_cols[0].error(f"PDF generation failed: {exc}")
         download_cols[1].download_button(
             "Download JSON",
@@ -1660,28 +1828,24 @@ def main() -> None:
             use_container_width=True,
         )
         download_cols[2].button("Refresh preview", use_container_width=True)
-        pdf_engine_ok, pdf_engine_detail = weasyprint_status()
-        if pdf_engine_ok:
-            st.caption("PDF export uses the same HTML/CSS as this preview, so colors, rounded cards, badges, graphics, spacing, and layout should closely match what you see above.")
-        else:
-            st.warning(
-                "Preview-matched PDF rendering is unavailable because the Linux system libraries required by WeasyPrint are missing or could not load. "
-                "`requirements.txt` installs the Python package; Streamlit Community Cloud needs a separate `packages.txt` for Pango/Harfbuzz."
-            )
-            with st.expander("PDF engine diagnostic"):
-                st.code(pdf_engine_detail)
+        chrome_ok, chrome_detail = chromium_status()
+        if pdf_engine_name.startswith("Chromium"):
+            st.success("PDF engine: Chromium - browser-faithful export. The PDF is printed from the exact same HTML/CSS used by the preview.")
+        elif pdf_engine_name.startswith("WeasyPrint"):
+            st.warning("PDF engine: WeasyPrint fallback. This uses the same HTML/CSS, but it is not the same browser renderer as the preview, so small layout differences can remain.")
+        elif pdf_engine_name.startswith("ReportLab"):
+            st.error("PDF engine: legacy ReportLab fallback. This will NOT look like the preview. Install Chromium in packages.txt to enable browser-faithful export.")
+        with st.expander("PDF engine diagnostic"):
+            st.code(f"Actual engine: {pdf_engine_name}\n{pdf_engine_detail}\n\nChromium check: {chrome_detail}")
+            if not chrome_ok:
                 st.markdown(
-                    """Add a `packages.txt` file **next to your requirements.txt** containing:
+                    """For **Streamlit Community Cloud**, add this line to `packages.txt` next to your app and `requirements.txt`:
 
 ```text
-libpango-1.0-0
-libpangoft2-1.0-0
-libharfbuzz-subset0
-libharfbuzz0b
-libfontconfig1
+chromium
 ```
 
-Then commit/push it and reboot the Streamlit app."""
+Keep your existing Pango/Harfbuzz lines if you also want WeasyPrint available as a secondary fallback. Commit the file and Streamlit will rebuild the deployment."""
                 )
 
     with archive_tab:
