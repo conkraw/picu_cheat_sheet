@@ -53,7 +53,10 @@ from xml.sax.saxutils import escape as xml_escape
 
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
+try:
+    import streamlit.components.v1 as components  # legacy fallback only
+except Exception:
+    components = None
 from PIL import Image as PILImage
 
 try:
@@ -62,6 +65,35 @@ try:
 except Exception as exc:  # pragma: no cover - depends on deployment environment
     WeasyHTML = None
     WEASYPRINT_IMPORT_ERROR = exc
+
+
+def weasyprint_status() -> Tuple[bool, str]:
+    """Return whether the preview-matched PDF engine is actually usable.
+
+    Installing the Python package alone is not enough on Linux. WeasyPrint also
+    needs native Pango/Harfbuzz libraries. Streamlit Community Cloud installs
+    those through packages.txt, not requirements.txt.
+    """
+    if WeasyHTML is None:
+        detail = str(WEASYPRINT_IMPORT_ERROR or "unknown import error")
+        return False, f"WeasyPrint import failed: {detail}"
+    try:
+        probe = WeasyHTML(string="<html><body><p>PDF engine test</p></body></html>").write_pdf()
+        if not probe or not probe.startswith(b"%PDF"):
+            return False, "WeasyPrint loaded but did not return a valid PDF during its self-test."
+        return True, "WeasyPrint is available and passed a PDF rendering self-test."
+    except Exception as exc:
+        return False, f"WeasyPrint rendering test failed: {exc}"
+
+
+def render_preview(preview_html: str, height: int = 900) -> None:
+    """Render preview with the current Streamlit API, with a legacy fallback."""
+    if hasattr(st, "iframe"):
+        st.iframe(preview_html, height=height, width="stretch")
+    elif components is not None:
+        components.html(preview_html, height=height, scrolling=True)
+    else:
+        st.html(preview_html)
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4, letter, landscape, portrait
@@ -79,7 +111,7 @@ from reportlab.platypus import (
 )
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 SCHEMA_VERSION = 1
 
 
@@ -1031,15 +1063,20 @@ def build_pdf_reportlab(doc: Dict[str, Any]) -> bytes:
 
 
 def build_pdf(doc: Dict[str, Any]) -> bytes:
-    """Create a PDF that visually matches the on-screen preview.
+    """Create a PDF that visually matches the on-screen preview when possible.
 
-    WeasyPrint renders the same HTML/CSS used by the preview, including rounded
-    cards, numbered badges, graphics, spacing, colors, and bottom-line banner.
-    The original ReportLab renderer remains as a deployment-safe fallback.
+    WeasyPrint renders the same HTML/CSS used by the preview. If the deployment
+    lacks WeasyPrint's native Linux libraries, the legacy ReportLab renderer is
+    still available so the user can export rather than losing PDF functionality.
     """
     if WeasyHTML is not None:
-        html_source = build_preview_html(doc, for_pdf=True)
-        return WeasyHTML(string=html_source, base_url=os.getcwd()).write_pdf()
+        try:
+            html_source = build_preview_html(doc, for_pdf=True)
+            pdf = WeasyHTML(string=html_source, base_url=os.getcwd()).write_pdf()
+            if pdf and pdf.startswith(b"%PDF"):
+                return pdf
+        except Exception:
+            pass
     return build_pdf_reportlab(doc)
 
 
@@ -1599,7 +1636,7 @@ def main() -> None:
     with preview_tab:
         doc["updated_at"] = utc_now_iso()
         preview_html = build_preview_html(doc)
-        components.html(preview_html, height=900, scrolling=True)
+        render_preview(preview_html, height=900)
 
         st.subheader("Download finalized files")
         download_cols = st.columns(3)
@@ -1623,10 +1660,29 @@ def main() -> None:
             use_container_width=True,
         )
         download_cols[2].button("Refresh preview", use_container_width=True)
-        if WeasyHTML is not None:
+        pdf_engine_ok, pdf_engine_detail = weasyprint_status()
+        if pdf_engine_ok:
             st.caption("PDF export uses the same HTML/CSS as this preview, so colors, rounded cards, badges, graphics, spacing, and layout should closely match what you see above.")
         else:
-            st.warning("Preview-matched PDF rendering is unavailable in this deployment. Add `weasyprint>=68.0` to requirements.txt; the app is currently using the legacy ReportLab fallback.")
+            st.warning(
+                "Preview-matched PDF rendering is unavailable because the Linux system libraries required by WeasyPrint are missing or could not load. "
+                "`requirements.txt` installs the Python package; Streamlit Community Cloud needs a separate `packages.txt` for Pango/Harfbuzz."
+            )
+            with st.expander("PDF engine diagnostic"):
+                st.code(pdf_engine_detail)
+                st.markdown(
+                    """Add a `packages.txt` file **next to your requirements.txt** containing:
+
+```text
+libpango-1.0-0
+libpangoft2-1.0-0
+libharfbuzz-subset0
+libharfbuzz0b
+libfontconfig1
+```
+
+Then commit/push it and reboot the Streamlit app."""
+                )
 
     with archive_tab:
         cfg, cfg_error = github_config()
